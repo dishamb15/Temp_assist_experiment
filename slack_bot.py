@@ -5,11 +5,15 @@ Slack bot module for monitoring temperature requests.
 import os
 import sys
 import logging
+import time
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
 from message_parser import parse_temperature_request, TemperatureAction, get_action_description
 from phone_caller import PhoneCaller
+
+# Rate limiting: only allow one call every 30 minutes (1800 seconds)
+CALL_COOLDOWN_SECONDS = 30 * 60
 
 # Set up logging
 logging.basicConfig(
@@ -30,6 +34,7 @@ class TemperatureBot:
         """
         self.phone_caller = phone_caller
         self.channel_name = os.getenv("SLACK_CHANNEL", "plivo_sports_updates")
+        self.last_call_time = 0  # Track last call timestamp for rate limiting
 
         print(f"[INIT] Initializing Slack app...", flush=True)
 
@@ -69,12 +74,26 @@ class TemperatureBot:
             if action != TemperatureAction.NONE:
                 print(f"[ACTION] Temperature action detected: {action.value}", flush=True)
 
+                # Check rate limiting
+                current_time = time.time()
+                time_since_last_call = current_time - self.last_call_time
+
+                if time_since_last_call < CALL_COOLDOWN_SECONDS:
+                    remaining_minutes = int((CALL_COOLDOWN_SECONDS - time_since_last_call) / 60)
+                    print(f"[RATE_LIMIT] Call skipped - cooldown active. {remaining_minutes} minutes remaining.", flush=True)
+                    say(
+                        f"I noticed the temperature request, but a call was already made recently. "
+                        f"To avoid duplicate calls, please wait {remaining_minutes} more minutes before the next call can be placed."
+                    )
+                    return
+
                 # Make the phone call
                 print(f"[CALL] Initiating phone call...", flush=True)
                 result = self.phone_caller.make_temperature_call(action)
                 print(f"[CALL] Result: {result}", flush=True)
 
                 if result["success"]:
+                    self.last_call_time = current_time  # Update last call time
                     action_desc = get_action_description(action)
                     say(
                         f"Got it! I'm calling facilities to {action_desc}. "
