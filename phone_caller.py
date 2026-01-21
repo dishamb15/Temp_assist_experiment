@@ -67,14 +67,14 @@ def get_tts_message(action: TemperatureAction) -> str:
     if action == TemperatureAction.INCREASE:
         return (
             "Hi, this is an automated call from Plivo. "
-            "Someone has reported that the temperature is too cold. "
+            "The employees have reported that the temperature is too cold. "
             "Please increase the AC temperature. "
             "Thank you."
         )
     elif action == TemperatureAction.DECREASE:
         return (
             "Hi, this is an automated call from Plivo. "
-            "Someone has reported that the temperature is too hot. "
+            "The employees have reported that the temperature is too hot. "
             "Please reduce the AC temperature. "
             "Thank you."
         )

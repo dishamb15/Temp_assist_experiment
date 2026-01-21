@@ -6,14 +6,20 @@ import os
 import sys
 import logging
 import time
+import threading
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
 from message_parser import parse_temperature_request, TemperatureAction, get_action_description
 from phone_caller import PhoneCaller
 
-# Rate limiting: only allow one call every 30 minutes (1800 seconds)
-CALL_COOLDOWN_SECONDS = 30 * 60
+# Rate limiting: only allow one call every 1 minute (60 seconds)
+CALL_COOLDOWN_SECONDS = 1 * 60
+
+# Polling configuration
+POLL_DURATION_SECONDS = 60  # 1 minute
+POLL_EMOJI_AGREE = "+1"      # 👍
+POLL_EMOJI_DISAGREE = "-1"   # 👎
 
 # File to persist last call time across restarts
 LAST_CALL_FILE = os.path.join(os.path.dirname(__file__), ".last_call_time")
@@ -59,6 +65,7 @@ class TemperatureBot:
         self.phone_caller = phone_caller
         self.channel_name = os.getenv("SLACK_CHANNEL", "plivo_sports_updates")
         self.last_call_time = load_last_call_time()  # Load from file to survive restarts
+        self.active_poll = None  # Track if there's an active poll
         print(f"[RATE_LIMIT] Loaded last call time: {self.last_call_time}", flush=True)
 
         print(f"[INIT] Initializing Slack app...", flush=True)
@@ -72,6 +79,114 @@ class TemperatureBot:
         self._register_handlers()
 
         print(f"[INIT] Handlers registered.", flush=True)
+
+    def _start_poll(self, channel: str, action: TemperatureAction, requester: str):
+        """Start a temperature poll in the channel."""
+        if action == TemperatureAction.DECREASE:
+            action_hint = "(make it cooler)"
+        else:
+            action_hint = "(make it warmer)"
+
+        poll_message = (
+            f"🌡️ *Wish to change temperature? {action_hint}*\n\n"
+            f"Please vote:\n"
+            f"• 👍 - Yes\n"
+            f"• 👎 - No\n\n"
+            f"_Poll ends in {POLL_DURATION_SECONDS} seconds. Action will be taken if majority agrees._"
+        )
+
+        # Post the poll message
+        result = self.app.client.chat_postMessage(channel=channel, text=poll_message)
+        poll_ts = result["ts"]
+
+        # Add reaction emojis to the message
+        self.app.client.reactions_add(channel=channel, timestamp=poll_ts, name=POLL_EMOJI_AGREE)
+        self.app.client.reactions_add(channel=channel, timestamp=poll_ts, name=POLL_EMOJI_DISAGREE)
+
+        print(f"[POLL] Started poll in channel {channel}, message ts: {poll_ts}", flush=True)
+
+        # Store active poll info
+        self.active_poll = {
+            "channel": channel,
+            "ts": poll_ts,
+            "action": action,
+            "requester": requester
+        }
+
+        # Schedule poll completion
+        timer = threading.Timer(POLL_DURATION_SECONDS, self._complete_poll, args=[channel, poll_ts, action])
+        timer.start()
+
+    def _complete_poll(self, channel: str, poll_ts: str, action: TemperatureAction):
+        """Complete the poll and take action based on results."""
+        print(f"[POLL] Completing poll {poll_ts}", flush=True)
+
+        try:
+            # Get reactions on the poll message
+            result = self.app.client.reactions_get(channel=channel, timestamp=poll_ts)
+            reactions = result.get("message", {}).get("reactions", [])
+
+            agree_count = 0
+            disagree_count = 0
+
+            for reaction in reactions:
+                if reaction["name"] == POLL_EMOJI_AGREE:
+                    # Subtract 1 because bot adds the initial reaction
+                    agree_count = reaction["count"] - 1
+                elif reaction["name"] == POLL_EMOJI_DISAGREE:
+                    disagree_count = reaction["count"] - 1
+
+            total_votes = agree_count + disagree_count
+            print(f"[POLL] Results - Agree: {agree_count}, Disagree: {disagree_count}, Total: {total_votes}", flush=True)
+
+            # Check for simple majority
+            if total_votes == 0:
+                self.app.client.chat_postMessage(
+                    channel=channel,
+                    text="⏱️ Poll ended with no votes. No action will be taken."
+                )
+            elif agree_count > disagree_count:
+                # Majority agrees - make the call
+                self._execute_temperature_action(channel, action, agree_count, disagree_count)
+            else:
+                # Majority disagrees or tie
+                self.app.client.chat_postMessage(
+                    channel=channel,
+                    text=f"⏱️ Poll ended. Majority did not agree ({agree_count} yes, {disagree_count} no). No action will be taken."
+                )
+
+        except Exception as e:
+            print(f"[POLL] Error completing poll: {e}", flush=True)
+            self.app.client.chat_postMessage(
+                channel=channel,
+                text=f"❌ Error processing poll results: {str(e)}"
+            )
+        finally:
+            self.active_poll = None
+
+    def _execute_temperature_action(self, channel: str, action: TemperatureAction, agree: int, disagree: int):
+        """Execute the temperature change after poll approval."""
+        print(f"[CALL] Poll passed - initiating phone call...", flush=True)
+
+        result = self.phone_caller.make_temperature_call(action)
+        print(f"[CALL] Result: {result}", flush=True)
+
+        if result["success"]:
+            current_time = time.time()
+            self.last_call_time = current_time
+            save_last_call_time(current_time)
+            action_desc = get_action_description(action)
+            self.app.client.chat_postMessage(
+                channel=channel,
+                text=f"✅ Poll passed ({agree} yes, {disagree} no)! Calling facilities to {action_desc}."
+            )
+            print(f"[CALL] Success - posted confirmation to Slack", flush=True)
+        else:
+            self.app.client.chat_postMessage(
+                channel=channel,
+                text=f"⏱️ Poll passed ({agree} yes, {disagree} no), but couldn't place the call. Error: {result.get('error', 'Unknown error')}"
+            )
+            print(f"[CALL] Failed: {result.get('error')}", flush=True)
 
     def _register_handlers(self):
         """Register event handlers for the Slack app."""
@@ -112,26 +227,15 @@ class TemperatureBot:
                     )
                     return
 
-                # Make the phone call
-                print(f"[CALL] Initiating phone call...", flush=True)
-                result = self.phone_caller.make_temperature_call(action)
-                print(f"[CALL] Result: {result}", flush=True)
+                # Check if there's already an active poll
+                if self.active_poll is not None:
+                    print(f"[POLL] Poll already active, ignoring new request", flush=True)
+                    say(f"A temperature poll is already in progress. Please vote on the existing poll!")
+                    return
 
-                if result["success"]:
-                    self.last_call_time = current_time  # Update last call time
-                    save_last_call_time(current_time)  # Persist to file
-                    action_desc = get_action_description(action)
-                    say(
-                        f"Got it! I'm calling facilities to {action_desc}. "
-                        f"Call initiated successfully."
-                    )
-                    print(f"[CALL] Success - posted confirmation to Slack", flush=True)
-                else:
-                    say(
-                        f"I detected a temperature request, but couldn't place the call. "
-                        f"Error: {result.get('error', 'Unknown error')}"
-                    )
-                    print(f"[CALL] Failed: {result.get('error')}", flush=True)
+                # Start a poll instead of making an immediate call
+                print(f"[POLL] Starting temperature poll...", flush=True)
+                self._start_poll(channel, action, user)
 
     def start(self):
         """Start the bot using Socket Mode."""
