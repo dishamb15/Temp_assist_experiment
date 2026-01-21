@@ -15,6 +15,9 @@ from phone_caller import PhoneCaller
 # Rate limiting: only allow one call every 30 minutes (1800 seconds)
 CALL_COOLDOWN_SECONDS = 30 * 60
 
+# File to persist last call time across restarts
+LAST_CALL_FILE = os.path.join(os.path.dirname(__file__), ".last_call_time")
+
 # Set up logging
 logging.basicConfig(
     level=logging.DEBUG,
@@ -22,6 +25,27 @@ logging.basicConfig(
     stream=sys.stdout
 )
 logger = logging.getLogger(__name__)
+
+
+def load_last_call_time() -> float:
+    """Load the last call time from file."""
+    try:
+        if os.path.exists(LAST_CALL_FILE):
+            with open(LAST_CALL_FILE, 'r') as f:
+                return float(f.read().strip())
+    except (ValueError, IOError) as e:
+        print(f"[RATE_LIMIT] Could not load last call time: {e}", flush=True)
+    return 0
+
+
+def save_last_call_time(timestamp: float):
+    """Save the last call time to file."""
+    try:
+        with open(LAST_CALL_FILE, 'w') as f:
+            f.write(str(timestamp))
+        print(f"[RATE_LIMIT] Saved last call time to file", flush=True)
+    except IOError as e:
+        print(f"[RATE_LIMIT] Could not save last call time: {e}", flush=True)
 
 
 class TemperatureBot:
@@ -34,7 +58,8 @@ class TemperatureBot:
         """
         self.phone_caller = phone_caller
         self.channel_name = os.getenv("SLACK_CHANNEL", "plivo_sports_updates")
-        self.last_call_time = 0  # Track last call timestamp for rate limiting
+        self.last_call_time = load_last_call_time()  # Load from file to survive restarts
+        print(f"[RATE_LIMIT] Loaded last call time: {self.last_call_time}", flush=True)
 
         print(f"[INIT] Initializing Slack app...", flush=True)
 
@@ -94,6 +119,7 @@ class TemperatureBot:
 
                 if result["success"]:
                     self.last_call_time = current_time  # Update last call time
+                    save_last_call_time(current_time)  # Persist to file
                     action_desc = get_action_description(action)
                     say(
                         f"Got it! I'm calling facilities to {action_desc}. "

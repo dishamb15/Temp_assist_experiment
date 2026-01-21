@@ -19,3 +19,6 @@ env/
 
 # OS
 .DS_Store
+
+# Rate limit state
+.last_call_time
